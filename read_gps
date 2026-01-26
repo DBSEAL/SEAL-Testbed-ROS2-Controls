@@ -3,6 +3,7 @@
 GPS Data Reader for u-blox 7 GPS/GNSS Receiver
 Reads and parses NMEA sentences from the GPS dongle
 """
+# code copied from https://github.com/theleestarr/ublox7_read and altered 1/26/2026
 
 import serial
 import pynmea2
