@@ -1,0 +1,733 @@
+#!/usr/bin/env python3
+"""
+GPS Data Reader for u-blox 7 GPS/GNSS Receiver
+Reads and parses NMEA sentences from the GPS dongle
+"""
+
+import serial
+import pynmea2
+import sys
+import time
+import os
+import signal
+
+# GPS device path
+GPS_DEVICE = '/dev/ttyACM0'
+BAUD_RATE = 9600  # Standard NMEA baud rate for u-blox 7
+
+def check_device():
+    """Check if GPS device is connected"""
+    if not os.path.exists(GPS_DEVICE):
+        print(f"Error: GPS device not found at {GPS_DEVICE}")
+        print("Please ensure the GPS dongle is connected.")
+        return False
+    return True
+
+def open_gps_connection():
+    """Open serial connection to GPS device"""
+    try:
+        ser = serial.Serial(
+            GPS_DEVICE,
+            baudrate=BAUD_RATE,
+            timeout=1,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE
+        )
+        print(f"Connected to GPS at {GPS_DEVICE} (baud rate: {BAUD_RATE})")
+        return ser
+    except serial.SerialException as e:
+        print(f"Error opening serial port: {e}")
+        return None
+    except PermissionError:
+        print(f"Permission denied: Cannot access {GPS_DEVICE}")
+        print("Try running with sudo or add your user to the dialout group:")
+        print("  sudo usermod -a -G dialout $USER")
+        return None
+
+def parse_nmea_sentence(line):
+    """Parse NMEA sentence and return formatted data"""
+    try:
+        msg = pynmea2.parse(line)
+        
+        if isinstance(msg, pynmea2.types.talker.RMC):
+            # Recommended Minimum Course
+            return {
+                'type': 'RMC',
+                'timestamp': msg.timestamp.strftime('%H:%M:%S') if msg.timestamp else 'N/A',
+                'status': 'Valid' if msg.status == 'A' else 'Invalid',
+                'latitude': f"{msg.latitude:.6f}° {msg.lat_dir}" if msg.latitude else 'N/A',
+                'longitude': f"{msg.longitude:.6f}° {msg.lon_dir}" if msg.longitude else 'N/A',
+                'speed': f"{msg.spd_over_grnd:.2f} knots" if msg.spd_over_grnd else 'N/A',
+                'course': f"{msg.true_course:.2f}°" if msg.true_course else 'N/A',
+                'date': msg.datestamp.strftime('%Y-%m-%d') if msg.datestamp else 'N/A'
+            }
+        elif isinstance(msg, pynmea2.types.talker.GGA):
+            # Global Positioning System Fix Data
+            fix_quality = {
+                0: 'Invalid',
+                1: 'GPS fix',
+                2: 'DGPS fix',
+                3: 'PPS fix',
+                4: 'RTK',
+                5: 'Float RTK'
+            }
+            # Check if coordinates are valid (not 0.0 and have direction)
+            lat_valid = msg.latitude is not None and msg.latitude != 0.0 and msg.lat_dir
+            lon_valid = msg.longitude is not None and msg.longitude != 0.0 and msg.lon_dir
+            
+            return {
+                'type': 'GGA',
+                'timestamp': msg.timestamp.strftime('%H:%M:%S') if msg.timestamp else 'N/A',
+                'latitude': f"{msg.latitude:.6f}° {msg.lat_dir}" if lat_valid else 'N/A',
+                'longitude': f"{msg.longitude:.6f}° {msg.lon_dir}" if lon_valid else 'N/A',
+                'fix_quality': fix_quality.get(msg.gps_qual, 'Unknown') if msg.gps_qual is not None else 'Invalid',
+                'num_satellites': msg.num_sats if msg.num_sats is not None and msg.num_sats != '' else 0,
+                'altitude': f"{msg.altitude:.2f} {msg.altitude_units}" if msg.altitude is not None and msg.altitude != 0.0 and msg.altitude != '' else 'N/A',
+                'hdop': f"{msg.horizontal_dil:.2f}" if msg.horizontal_dil is not None and msg.horizontal_dil != '' else 'N/A'
+            }
+        elif isinstance(msg, pynmea2.types.talker.GSA):
+            # GPS DOP and active satellites
+            fix_type_map = {
+                '1': 'No Fix',
+                '2': '2D',
+                '3': '3D'
+            }
+            mode_fix = msg.mode_fix_type if msg.mode_fix_type else None
+            fix_type = fix_type_map.get(mode_fix, 'N/A') if mode_fix else 'N/A'
+            
+            return {
+                'type': 'GSA',
+                'mode': mode_fix if mode_fix else 'N/A',
+                'fix_type': fix_type,
+                'pdop': f"{msg.pdop:.2f}" if msg.pdop is not None and msg.pdop != '' else 'N/A',
+                'hdop': f"{msg.hdop:.2f}" if msg.hdop is not None and msg.hdop != '' else 'N/A',
+                'vdop': f"{msg.vdop:.2f}" if msg.vdop is not None and msg.vdop != '' else 'N/A'
+            }
+        elif isinstance(msg, pynmea2.types.talker.GSV):
+            # GPS Satellites in view - extract individual satellite data
+            satellites = []
+            
+            # GSV sentences can contain up to 4 satellites per message
+            # Extract satellite data if available
+            def safe_int(value):
+                """Safely convert value to int, return None if empty or invalid"""
+                if not value or value == '':
+                    return None
+                try:
+                    return int(value)
+                except (ValueError, TypeError):
+                    return None
+            
+            def safe_float(value):
+                """Safely convert value to float, return None if empty or invalid"""
+                if not value or value == '':
+                    return None
+                try:
+                    return float(value)
+                except (ValueError, TypeError):
+                    return None
+            
+            if hasattr(msg, 'sv_prn_num_1') and msg.sv_prn_num_1:
+                satellites.append({
+                    'prn': safe_int(msg.sv_prn_num_1),
+                    'elevation': safe_float(msg.elevation_deg_1) if hasattr(msg, 'elevation_deg_1') else None,
+                    'azimuth': safe_float(msg.azimuth_1) if hasattr(msg, 'azimuth_1') else None,
+                    'snr': safe_float(msg.snr_1) if hasattr(msg, 'snr_1') else None
+                })
+            if hasattr(msg, 'sv_prn_num_2') and msg.sv_prn_num_2:
+                satellites.append({
+                    'prn': safe_int(msg.sv_prn_num_2),
+                    'elevation': safe_float(msg.elevation_deg_2) if hasattr(msg, 'elevation_deg_2') else None,
+                    'azimuth': safe_float(msg.azimuth_2) if hasattr(msg, 'azimuth_2') else None,
+                    'snr': safe_float(msg.snr_2) if hasattr(msg, 'snr_2') else None
+                })
+            if hasattr(msg, 'sv_prn_num_3') and msg.sv_prn_num_3:
+                satellites.append({
+                    'prn': safe_int(msg.sv_prn_num_3),
+                    'elevation': safe_float(msg.elevation_deg_3) if hasattr(msg, 'elevation_deg_3') else None,
+                    'azimuth': safe_float(msg.azimuth_3) if hasattr(msg, 'azimuth_3') else None,
+                    'snr': safe_float(msg.snr_3) if hasattr(msg, 'snr_3') else None
+                })
+            if hasattr(msg, 'sv_prn_num_4') and msg.sv_prn_num_4:
+                satellites.append({
+                    'prn': safe_int(msg.sv_prn_num_4),
+                    'elevation': safe_float(msg.elevation_deg_4) if hasattr(msg, 'elevation_deg_4') else None,
+                    'azimuth': safe_float(msg.azimuth_4) if hasattr(msg, 'azimuth_4') else None,
+                    'snr': safe_float(msg.snr_4) if hasattr(msg, 'snr_4') else None
+                })
+            
+            # Convert to int for easier comparison, but keep original for display
+            try:
+                total_msgs_int = int(msg.num_messages) if msg.num_messages else None
+                msg_num_int = int(msg.msg_num) if msg.msg_num else None
+            except (ValueError, TypeError):
+                total_msgs_int = None
+                msg_num_int = None
+            
+            return {
+                'type': 'GSV',
+                'total_messages': total_msgs_int if total_msgs_int is not None else 'N/A',
+                'message_number': msg_num_int if msg_num_int is not None else 'N/A',
+                'satellites_in_view': msg.num_sv_in_view if msg.num_sv_in_view else 'N/A',
+                'satellites': satellites
+            }
+        else:
+            return {'type': type(msg).__name__, 'raw': str(msg)}
+    except pynmea2.ParseError as e:
+        # Silently skip parse errors (malformed sentences)
+        return None
+    except Exception as e:
+        # Log other errors but don't crash
+        return None
+
+def get_satellite_status(snr):
+    """Get status string based on SNR"""
+    if snr is None:
+        return "Unknown"
+    if snr >= 40:
+        return "Excellent"
+    elif snr >= 30:
+        return "Good"
+    elif snr >= 20:
+        return "Fair"
+    elif snr > 0:
+        return "Weak"
+    else:
+        return "No signal"
+
+def format_dashboard(rmc_data, gga_data, gsa_data, satellites_dict):
+    """Format all GPS data into a fixed dashboard display"""
+    lines = []
+    
+    # Header - more compact
+    lines.append("=" * 80)
+    lines.append("GPS DASHBOARD - u-blox 7 GPS/GNSS Receiver".center(80))
+    lines.append("=" * 80)
+    
+    # Determine GPS LOCK status
+    gps_lock = "NO LOCK"
+    lock_color = '\033[91m'  # Red
+    lock_icon = "🔴"
+    
+    # Check for GPS lock - RMC status 'Valid' means we have a lock!
+    has_lock = False
+    lock_type = ""
+    
+    # Check RMC status first - 'Valid' means GPS has a lock
+    if rmc_data and rmc_data.get('status') == 'Valid':
+        has_lock = True
+        # Try to determine lock type from other sources
+        if gsa_data:
+            fix_type = gsa_data.get('fix_type', 'N/A')
+            if fix_type in ['2D', '3D']:
+                lock_type = fix_type
+        elif gga_data:
+            fix_quality = gga_data.get('fix_quality', 'N/A')
+            if fix_quality in ['GPS fix', 'DGPS fix', 'PPS fix', 'RTK', 'Float RTK']:
+                # Check if we have coordinates
+                lat = gga_data.get('latitude', 'N/A')
+                lon = gga_data.get('longitude', 'N/A')
+                if lat != 'N/A' and lon != 'N/A':
+                    lock_type = fix_quality
+        # If we have satellites in view, we likely have a lock
+        if not lock_type and satellites_dict and len(satellites_dict) >= 4:
+            lock_type = "GPS"  # Generic GPS lock if we have enough sats
+    
+    # Also check GSA fix type directly
+    if gsa_data:
+        fix_type = gsa_data.get('fix_type', 'N/A')
+        if fix_type in ['2D', '3D']:
+            has_lock = True
+            lock_type = fix_type
+    
+    # Check GGA for fix quality and coordinates
+    if gga_data:
+        fix_quality = gga_data.get('fix_quality', 'N/A')
+        lat = gga_data.get('latitude', 'N/A')
+        lon = gga_data.get('longitude', 'N/A')
+        # Has lock if we have valid coordinates
+        if lat != 'N/A' and lon != 'N/A':
+            has_lock = True
+            if fix_quality in ['GPS fix', 'DGPS fix', 'PPS fix', 'RTK', 'Float RTK']:
+                if not lock_type:
+                    lock_type = fix_quality
+    
+    # Set lock status
+    if has_lock:
+        if lock_type:
+            gps_lock = f"LOCK ({lock_type})"
+        else:
+            gps_lock = "LOCK"
+        lock_color = '\033[92m'  # Green
+        lock_icon = "🟢"
+    elif satellites_dict and len(satellites_dict) >= 4:
+        # Have satellites but no confirmed lock yet
+        gps_lock = "ACQUIRING"
+        lock_color = '\033[93m'  # Yellow
+        lock_icon = "🟡"
+    else:
+        gps_lock = "NO LOCK"
+        lock_color = '\033[91m'  # Red
+        lock_icon = "🔴"
+    
+    # Display GPS LOCK status prominently
+    lock_display = f"{lock_color}GPS LOCK: {lock_icon} {gps_lock}\033[0m"
+    lines.append("")
+    lines.append(lock_display.center(80))
+    lines.append("")
+    
+    # Two-column layout for better space usage
+    # Left column: Status and Position
+    # Right column: Fix Quality
+    
+    # GPS Status Section - compact
+    lines.append("GPS STATUS")
+    lines.append("-" * 39 + "  " + "-" * 39)
+    status_line = ""
+    if rmc_data:
+        status = rmc_data.get('status', 'N/A')
+        status_color = '\033[92m' if status == 'Valid' else '\033[91m' if status == 'Invalid' else '\033[93m'
+        status_line = f"Status: {status_color}{status}\033[0m"
+        time_str = f"Time: {rmc_data.get('timestamp', 'N/A')}"
+        date_str = f"Date: {rmc_data.get('date', 'N/A')}"
+    else:
+        status_line = "Status: Waiting..."
+        time_str = "Time: N/A"
+        date_str = "Date: N/A"
+    
+    # Position Section - compact, on right side
+    # If GPS is locked, show position data (from GGA or RMC)
+    pos_line = "POSITION"
+    if has_lock:
+        # GPS is locked - show position data
+        if gga_data:
+            lat = gga_data.get('latitude', 'N/A')
+            lon = gga_data.get('longitude', 'N/A')
+            # If GGA has valid coordinates, use them
+            if lat != 'N/A' and lon != 'N/A':
+                lat_str = f"Lat:  {lat[:25] if len(str(lat)) > 25 else lat}"
+                lon_str = f"Lon:  {lon[:25] if len(str(lon)) > 25 else lon}"
+                alt_str = f"Alt:  {gga_data.get('altitude', 'N/A')}"
+                fix_q = f"Fix:  {gga_data.get('fix_quality', 'N/A')}"
+                sats_used = f"Sats: {gga_data.get('num_satellites', 'N/A')}"
+                hdop_str = f"HDOP: {gga_data.get('hdop', 'N/A')}"
+            else:
+                # GGA doesn't have coordinates, try RMC
+                if rmc_data:
+                    lat = rmc_data.get('latitude', 'N/A')
+                    lon = rmc_data.get('longitude', 'N/A')
+                    lat_str = f"Lat:  {lat[:25] if lat != 'N/A' and len(str(lat)) > 25 else lat}"
+                    lon_str = f"Lon:  {lon[:25] if lon != 'N/A' and len(str(lon)) > 25 else lon}"
+                    alt_str = "Alt:  N/A"
+                    fix_q = f"Fix:  {lock_type if lock_type else 'GPS fix'}"
+                    sats_used = f"Sats: {len(satellites_dict) if satellites_dict else 'N/A'}"
+                    hdop_str = "HDOP: N/A"
+                else:
+                    lat_str = "Lat:  Calculating..."
+                    lon_str = "Lon:  Calculating..."
+                    alt_str = "Alt:  N/A"
+                    fix_q = f"Fix:  {lock_type if lock_type else 'GPS fix'}"
+                    sats_used = f"Sats: {len(satellites_dict) if satellites_dict else 'N/A'}"
+                    hdop_str = "HDOP: N/A"
+        elif rmc_data:
+            # No GGA but have RMC and lock
+            lat = rmc_data.get('latitude', 'N/A')
+            lon = rmc_data.get('longitude', 'N/A')
+            lat_str = f"Lat:  {lat[:25] if lat != 'N/A' and len(str(lat)) > 25 else lat}"
+            lon_str = f"Lon:  {lon[:25] if lon != 'N/A' and len(str(lon)) > 25 else lon}"
+            alt_str = "Alt:  N/A"
+            fix_q = f"Fix:  {lock_type if lock_type else 'GPS fix'}"
+            sats_used = f"Sats: {len(satellites_dict) if satellites_dict else 'N/A'}"
+            hdop_str = "HDOP: N/A"
+        else:
+            # Locked but no position data yet
+            lat_str = "Lat:  Calculating..."
+            lon_str = "Lon:  Calculating..."
+            alt_str = "Alt:  N/A"
+            fix_q = f"Fix:  {lock_type if lock_type else 'GPS fix'}"
+            sats_used = f"Sats: {len(satellites_dict) if satellites_dict else 'N/A'}"
+            hdop_str = "HDOP: N/A"
+    elif gga_data:
+        # Not locked but have GGA data
+        lat_str = f"Lat:  {gga_data.get('latitude', 'N/A')[:25] if len(str(gga_data.get('latitude', 'N/A'))) > 25 else gga_data.get('latitude', 'N/A')}"
+        lon_str = f"Lon:  {gga_data.get('longitude', 'N/A')[:25] if len(str(gga_data.get('longitude', 'N/A'))) > 25 else gga_data.get('longitude', 'N/A')}"
+        alt_str = f"Alt:  {gga_data.get('altitude', 'N/A')}"
+        fix_q = f"Fix:  {gga_data.get('fix_quality', 'N/A')}"
+        sats_used = f"Sats: {gga_data.get('num_satellites', 'N/A')}"
+        hdop_str = f"HDOP: {gga_data.get('hdop', 'N/A')}"
+    else:
+        lat_str = "Lat:  N/A"
+        lon_str = "Lon:  N/A"
+        alt_str = "Alt:  N/A"
+        fix_q = "Fix:  N/A"
+        sats_used = "Sats: N/A"
+        hdop_str = "HDOP: N/A"
+    
+    # Fix Quality - compact
+    # If locked, show fix quality prominently
+    if has_lock and lock_type:
+        # GPS is locked - show lock type prominently
+        if lock_type in ['3D', '2D']:
+            fix_color = '\033[92m' if lock_type == '3D' else '\033[93m'
+            fix_type_str = f"Type: {fix_color}{lock_type}\033[0m"
+        else:
+            fix_type_str = f"Type: \033[92m{lock_type}\033[0m"
+    elif gsa_data:
+        fix_type = gsa_data.get('fix_type', 'N/A')
+        # Color coding: green for 3D, yellow for 2D, red for No Fix or N/A
+        if fix_type == '3D':
+            fix_color = '\033[92m'  # Green
+        elif fix_type == '2D':
+            fix_color = '\033[93m'  # Yellow
+        elif fix_type == 'No Fix':
+            fix_color = '\033[91m'  # Red
+        else:
+            fix_color = '\033[90m'  # Dark gray for N/A
+        fix_type_str = f"Type: {fix_color}{fix_type}\033[0m"
+    else:
+        fix_type_str = "Type: N/A"
+    
+    # DOP values
+    if gsa_data:
+        pdop_str = f"PDOP: {gsa_data.get('pdop', 'N/A')}"
+        hdop_gsa = f"HDOP: {gsa_data.get('hdop', 'N/A')}"
+        vdop_str = f"VDOP: {gsa_data.get('vdop', 'N/A')}"
+    elif has_lock and gga_data:
+        # Locked but no GSA, use GGA HDOP
+        pdop_str = "PDOP: N/A"
+        hdop_gsa = f"HDOP: {gga_data.get('hdop', 'N/A')}"
+        vdop_str = "VDOP: N/A"
+    else:
+        pdop_str = "PDOP: N/A"
+        hdop_gsa = "HDOP: N/A"
+        vdop_str = "VDOP: N/A"
+    
+    # Layout in two columns
+    lines.append(f"{status_line:<39}  {pos_line}")
+    lines.append(f"{time_str:<39}  {lat_str}")
+    lines.append(f"{date_str:<39}  {lon_str}")
+    if rmc_data and rmc_data.get('status') == 'Valid':
+        speed_str = f"Speed: {rmc_data.get('speed', 'N/A')}"
+        course_str = f"Course: {rmc_data.get('course', 'N/A')}"
+        lines.append(f"{speed_str:<39}  {alt_str}")
+        lines.append(f"{course_str:<39}  {fix_q}")
+    else:
+        lines.append(f"{'':<39}  {alt_str}")
+        lines.append(f"{'':<39}  {fix_q}")
+    
+    lines.append("")
+    lines.append("FIX QUALITY")
+    lines.append("-" * 80)
+    lines.append(f"{fix_type_str:<39}  {sats_used}")
+    lines.append(f"{pdop_str:<39}  {hdop_str}")
+    lines.append(f"{hdop_gsa:<39}")
+    lines.append(f"{vdop_str:<39}")
+    lines.append("")
+    
+    # Satellites Section - more compact
+    lines.append("SATELLITES IN VIEW")
+    lines.append("-" * 80)
+    if satellites_dict:
+        lines.append(f"Total: {len(satellites_dict)} satellites")
+        lines.append(f"{'PRN':<5} {'Elv':<6} {'Azm':<6} {'SNR':<6} {'Status':<10} | {'PRN':<5} {'Elv':<6} {'Azm':<6} {'SNR':<6} {'Status':<10}")
+        lines.append("-" * 80)
+        
+        # Sort satellites by SNR (highest first)
+        sorted_sats = sorted(satellites_dict.items(), 
+                            key=lambda x: (x[1].get('snr') or 0, x[0]), 
+                            reverse=True)
+        
+        # Display in two columns to save space
+        for i in range(0, len(sorted_sats), 2):
+            line_parts = []
+            # Left column
+            if i < len(sorted_sats):
+                prn, sat_info = sorted_sats[i]
+                elevation = f"{sat_info.get('elevation', 0):.0f}°" if sat_info.get('elevation') is not None else "N/A"
+                azimuth = f"{sat_info.get('azimuth', 0):.0f}°" if sat_info.get('azimuth') is not None else "N/A"
+                snr = f"{sat_info.get('snr', 0):.0f}" if sat_info.get('snr') is not None else "N/A"
+                status = get_satellite_status(sat_info.get('snr'))[:8]  # Truncate status
+                line_parts.append(f"{prn:<5} {elevation:<6} {azimuth:<6} {snr:<6} {status:<10}")
+            else:
+                line_parts.append(f"{'':<35}")
+            
+            # Right column
+            if i + 1 < len(sorted_sats):
+                prn, sat_info = sorted_sats[i + 1]
+                elevation = f"{sat_info.get('elevation', 0):.0f}°" if sat_info.get('elevation') is not None else "N/A"
+                azimuth = f"{sat_info.get('azimuth', 0):.0f}°" if sat_info.get('azimuth') is not None else "N/A"
+                snr = f"{sat_info.get('snr', 0):.0f}" if sat_info.get('snr') is not None else "N/A"
+                status = get_satellite_status(sat_info.get('snr'))[:8]  # Truncate status
+                line_parts.append(f"{prn:<5} {elevation:<6} {azimuth:<6} {snr:<6} {status:<10}")
+            
+            lines.append(" | ".join(line_parts))
+    else:
+        lines.append("No satellite data available")
+    lines.append("")
+    lines.append("=" * 80)
+    lines.append("Press Ctrl+C to exit")
+    
+    return "\n".join(lines)
+
+def clear_screen():
+    """Clear screen and move cursor to top"""
+    # Use escape sequence to clear screen and move to home position
+    sys.stdout.write("\033[2J\033[H")
+    sys.stdout.flush()
+
+def display_dashboard(rmc_data, gga_data, gsa_data, satellites_dict):
+    """Display the dashboard (fixed position)"""
+    clear_screen()
+    dashboard = format_dashboard(rmc_data, gga_data, gsa_data, satellites_dict)
+    sys.stdout.write(dashboard)
+    sys.stdout.flush()
+
+def display_gps_data(data):
+    """Display parsed GPS data in a readable format"""
+    if not data:
+        return
+    
+    # Special handling for satellite data
+    if data.get('type') == 'GSV' and 'satellites' in data:
+        # This will be handled by the satellite tracking system
+        return
+    
+    print("\n" + "="*60)
+    print(f"GPS Data Type: {data.get('type', 'Unknown')}")
+    print("="*60)
+    
+    for key, value in data.items():
+        if key not in ['type', 'satellites']:
+            print(f"  {key.replace('_', ' ').title()}: {value}")
+    print()
+
+def read_gps_continuous(ser, display_raw=False, show_satellites=True):
+    """Continuously read and parse GPS data with fixed dashboard display"""
+    # Store current data
+    rmc_data = None
+    gga_data = None
+    gsa_data = None
+    satellites_dict = {}
+    gsv_messages = {}
+    last_dashboard_update = 0
+    update_interval = 1.0  # Update dashboard every 1 second (less frequent to reduce flicker)
+    
+    # Handle terminal resize gracefully
+    def signal_handler(sig, frame):
+        # Restore cursor and clear
+        print("\033[?25h")  # Show cursor
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # Hide cursor for cleaner display and clear screen
+    print("\033[?25l", end='')
+    clear_screen()
+    
+    try:
+        while True:
+            line = ser.readline().decode('ascii', errors='ignore').strip()
+            
+            if not line:
+                continue
+            
+            # Display raw NMEA if requested (but this will interfere with dashboard)
+            if display_raw:
+                # Store raw line but don't print (would mess up dashboard)
+                pass
+            
+            # Parse NMEA sentence
+            data = parse_nmea_sentence(line)
+            
+            if data:
+                # Handle GSV messages - collect all parts
+                if show_satellites and data.get('type') == 'GSV':
+                    total_msgs = data.get('total_messages')
+                    msg_num = data.get('message_number')
+                    
+                    if isinstance(total_msgs, int) and isinstance(msg_num, int):
+                        if total_msgs not in gsv_messages:
+                            gsv_messages[total_msgs] = {}
+                        
+                        gsv_messages[total_msgs][msg_num] = data
+                        
+                        # Check if we have all messages for this set
+                        if len(gsv_messages[total_msgs]) == total_msgs:
+                            # Collect all satellites from all messages
+                            satellites_dict.clear()
+                            for msg_data in gsv_messages[total_msgs].values():
+                                for sat in msg_data.get('satellites', []):
+                                    prn = sat.get('prn')
+                                    if prn is not None:
+                                        satellites_dict[prn] = {
+                                            'elevation': sat.get('elevation'),
+                                            'azimuth': sat.get('azimuth'),
+                                            'snr': sat.get('snr')
+                                        }
+                            # Clear this message set
+                            gsv_messages[total_msgs] = {}
+                            # Update dashboard after satellites are collected
+                            current_time = time.time()
+                            if current_time - last_dashboard_update >= update_interval:
+                                display_dashboard(rmc_data, gga_data, gsa_data, satellites_dict)
+                                last_dashboard_update = current_time
+                
+                # Store RMC data
+                elif data.get('type') == 'RMC':
+                    rmc_data = data
+                    current_time = time.time()
+                    if current_time - last_dashboard_update >= update_interval:
+                        display_dashboard(rmc_data, gga_data, gsa_data, satellites_dict)
+                        last_dashboard_update = current_time
+                
+                # Store GGA data (always store, even if no fix)
+                elif data.get('type') == 'GGA':
+                    gga_data = data
+                    current_time = time.time()
+                    if current_time - last_dashboard_update >= update_interval:
+                        display_dashboard(rmc_data, gga_data, gsa_data, satellites_dict)
+                        last_dashboard_update = current_time
+                
+                # Store GSA data (always store, even if no fix)
+                elif data.get('type') == 'GSA':
+                    gsa_data = data
+                    current_time = time.time()
+                    if current_time - last_dashboard_update >= update_interval:
+                        display_dashboard(rmc_data, gga_data, gsa_data, satellites_dict)
+                        last_dashboard_update = current_time
+            
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        print(f"\nError reading GPS data: {e}")
+    finally:
+        # Restore cursor
+        print("\033[?25h")
+        print("\n\nGPS connection closed.")
+
+def read_gps_single(ser, show_satellites=False):
+    """Read a single GPS fix and display it"""
+    print("Reading GPS data (single read)...")
+    print("Waiting for GPS fix...\n")
+    
+    gga_data = None
+    rmc_data = None
+    satellites_dict = {}
+    gsv_messages = {}
+    
+    timeout = time.time() + 30  # 30 second timeout
+    
+    try:
+        while time.time() < timeout:
+            line = ser.readline().decode('ascii', errors='ignore').strip()
+            
+            if not line:
+                continue
+            
+            data = parse_nmea_sentence(line)
+            
+            if data:
+                # Collect satellite data if requested
+                if show_satellites and data.get('type') == 'GSV':
+                    total_msgs = data.get('total_messages')
+                    msg_num = data.get('message_number')
+                    
+                    if total_msgs != 'N/A' and msg_num != 'N/A':
+                        if total_msgs not in gsv_messages:
+                            gsv_messages[total_msgs] = {}
+                        
+                        gsv_messages[total_msgs][msg_num] = data
+                        
+                        # Check if we have all messages for this set
+                        if len(gsv_messages[total_msgs]) == total_msgs:
+                            satellites_dict.clear()
+                            for msg_data in gsv_messages[total_msgs].values():
+                                for sat in msg_data.get('satellites', []):
+                                    if sat.get('prn'):
+                                        satellites_dict[sat['prn']] = {
+                                            'elevation': sat.get('elevation'),
+                                            'azimuth': sat.get('azimuth'),
+                                            'snr': sat.get('snr')
+                                        }
+                            gsv_messages[total_msgs] = {}
+                
+                if data.get('type') == 'GGA' and not gga_data:
+                    gga_data = data
+                    display_gps_data(data)
+                elif data.get('type') == 'RMC' and not rmc_data:
+                    rmc_data = data
+                    display_gps_data(data)
+                
+                if gga_data and rmc_data:
+                    if show_satellites and satellites_dict:
+                        display_satellite_info(satellites_dict)
+                    break
+        
+        if not gga_data and not rmc_data:
+            print("Timeout: No GPS fix received within 30 seconds.")
+            print("Make sure the GPS has a clear view of the sky.")
+        elif show_satellites and not satellites_dict:
+            print("\nNote: Satellite information not available in this reading.")
+    except Exception as e:
+        print(f"Error reading GPS data: {e}")
+
+def main():
+    """Main function"""
+    import argparse
+    
+    global GPS_DEVICE, BAUD_RATE
+    
+    parser = argparse.ArgumentParser(
+        description='Read GPS data from u-blox 7 GPS/GNSS Receiver',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s                    # Continuous reading with satellite info
+  %(prog)s --single           # Read once and exit
+  %(prog)s --single --sats    # Read once with satellite details
+  %(prog)s --raw              # Show raw NMEA sentences
+  %(prog)s --no-sats          # Disable satellite information
+  %(prog)s --device /dev/ttyUSB0  # Use different device
+        """
+    )
+    parser.add_argument('--single', action='store_true',
+                       help='Read GPS data once and exit')
+    parser.add_argument('--raw', action='store_true',
+                       help='Display raw NMEA sentences')
+    parser.add_argument('--sats', '--satellites', action='store_true', default=True,
+                       dest='show_satellites',
+                       help='Show detailed satellite information (default: enabled)')
+    parser.add_argument('--no-sats', action='store_false', dest='show_satellites',
+                       help='Disable satellite information display')
+    parser.add_argument('--device', default=GPS_DEVICE,
+                       help=f'GPS device path (default: {GPS_DEVICE})')
+    parser.add_argument('--baud', type=int, default=BAUD_RATE,
+                       help=f'Baud rate (default: {BAUD_RATE})')
+    
+    args = parser.parse_args()
+    
+    GPS_DEVICE = args.device
+    BAUD_RATE = args.baud
+    
+    # Check if device exists
+    if not check_device():
+        sys.exit(1)
+    
+    # Open GPS connection
+    ser = open_gps_connection()
+    if not ser:
+        sys.exit(1)
+    
+    try:
+        if args.single:
+            read_gps_single(ser, show_satellites=args.show_satellites)
+        else:
+            read_gps_continuous(ser, display_raw=args.raw, show_satellites=args.show_satellites)
+    finally:
+        ser.close()
+        print("GPS connection closed.")
+
+if __name__ == '__main__':
+    main()
