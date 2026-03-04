@@ -1,2 +1,6 @@
 .vscode/
-
+.install/
+.build/
+.log/
+**/*.pyc
+**/__pycache__/
